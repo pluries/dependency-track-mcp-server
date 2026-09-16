@@ -4,12 +4,18 @@ const fs = require("fs");
 const path = require("path");
 const process = require("process");
 
+// MCP stdio transport is newline-delimited JSON-RPC (one message per line). Content-Length framing (LSP style) is
+// accepted too, for clients that still send it; every reply uses the framing of the request that produced it.
+let outputFraming = "ndjson";
 function serializeMessage(message) {
   const payload = JSON.stringify(message);
-  return `Content-Length: ${Buffer.byteLength(payload, "utf8")}\r\n\r\n${payload}`;
+  if (outputFraming === "header") {
+    return `Content-Length: ${Buffer.byteLength(payload, "utf8")}\r\n\r\n${payload}`;
+  }
+  return `${payload}\n`;
 }
 
-class HeaderFramedReader {
+class DualFramedReader {
   constructor(onMessage, onError) {
     this.onMessage = onMessage;
     this.onError = onError;
@@ -23,33 +29,46 @@ class HeaderFramedReader {
 
   process() {
     while (true) {
-      const headerEnd = this.buffer.indexOf("\r\n\r\n");
-      if (headerEnd === -1) {
-        return;
+      // skip leading whitespace / blank lines
+      let start = 0;
+      while (start < this.buffer.length && (this.buffer[start] === 0x0a || this.buffer[start] === 0x0d || this.buffer[start] === 0x20 || this.buffer[start] === 0x09)) start++;
+      if (start) this.buffer = this.buffer.subarray(start);
+      if (!this.buffer.length) return;
+
+      if (this.buffer[0] === 0x7b /* { */) {
+        const nl = this.buffer.indexOf("\n");
+        if (nl === -1) return;
+        const line = this.buffer.subarray(0, nl).toString("utf8").trim();
+        this.buffer = this.buffer.subarray(nl + 1);
+        outputFraming = "ndjson";
+        this.dispatch(line);
+        continue;
       }
 
+      const headerEnd = this.buffer.indexOf("\r\n\r\n");
+      if (headerEnd === -1) return;
       const headerText = this.buffer.subarray(0, headerEnd).toString("utf8");
       const match = headerText.match(/Content-Length:\s*(\d+)/i);
       if (!match) {
         this.onError(new Error(`Missing Content-Length header: ${headerText}`));
         return;
       }
-
       const contentLength = Number(match[1]);
       const totalLength = headerEnd + 4 + contentLength;
-      if (this.buffer.length < totalLength) {
-        return;
-      }
-
+      if (this.buffer.length < totalLength) return;
       const body = this.buffer.subarray(headerEnd + 4, totalLength).toString("utf8");
       this.buffer = this.buffer.subarray(totalLength);
+      outputFraming = "header";
+      this.dispatch(body);
+    }
+  }
 
-      try {
-        this.onMessage(JSON.parse(body));
-      } catch (error) {
-        this.onError(error);
-        return;
-      }
+  dispatch(text) {
+    if (!text) return;
+    try {
+      this.onMessage(JSON.parse(text));
+    } catch (error) {
+      this.onError(error);
     }
   }
 }
@@ -623,9 +642,8 @@ async function handleMessage(message) {
   }
 }
 
-const reader = new HeaderFramedReader(handleMessage, (error) => {
+const reader = new DualFramedReader(handleMessage, (error) => {
   logError(error);
-  process.exit(1);
 });
 
 process.stdin.on("data", (chunk) => reader.append(chunk));
